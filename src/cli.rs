@@ -84,6 +84,9 @@ pub struct Opts {
     /// system that answers. The results are then copied to the other hosts.
     #[arg(long, conflicts_with = "remote_build")]
     build_per_system: bool,
+    /// Fail a node whose copy takes longer than this many seconds
+    #[arg(long)]
+    copy_timeout: Option<u64>,
 
     /// Override the SSH user with the given value
     #[arg(long)]
@@ -500,6 +503,8 @@ pub enum RunDeployError {
     DeployDataDefs(#[from] deploy::DeployDataDefsError),
     #[error("{0}")]
     BuildPlan(#[from] deploy::build_plan::BuildPlanError),
+    #[error("Node {0} did not answer over SSH")]
+    Unreachable(String),
     #[error("Failed to make printable TOML of deployment: {0}")]
     TomlFormat(#[from] toml::ser::Error),
     #[error("{0}")]
@@ -519,6 +524,7 @@ impl RunDeployError {
             RunDeployError::DeployProfile(_, node, _)
             | RunDeployError::BuildProfile(_, node, _)
             | RunDeployError::PushProfile(_, node, _) => Some(node),
+            RunDeployError::Unreachable(node) => Some(node),
             _ => None,
         }
     }
@@ -563,6 +569,7 @@ async fn run_deploy(
     keep_going: bool,
     no_progress: bool,
     demarcate_output: bool,
+    copy_timeout: Option<u64>,
     mp: MultiProgress,
 ) -> Result<(), RunDeployError> {
     let to_deploy: ToDeploy = deploy_flakes
@@ -754,12 +761,19 @@ async fn run_deploy(
                 result_path: result_path.map(str::to_string),
                 extra_build_args: extra_build_args.to_vec(),
                 build_host: None,
+                copy_timeout: copy_timeout.map(std::time::Duration::from_secs),
             },
         )
         .collect();
 
+    // Nodes that didn't answer, failed before anything is built for them
+    let mut unreachable: Vec<String> = Vec::new();
     if cmd_overrides.build_per_system {
-        deploy::build_plan::assign_build_hosts(&mut push_data).await?;
+        unreachable = deploy::build_plan::assign_build_hosts(&mut push_data).await?;
+        if !unreachable.is_empty() && !keep_going {
+            return Err(RunDeployError::Unreachable(unreachable[0].clone()));
+        }
+        push_data.retain(|data| !unreachable.contains(&data.deploy_data.node_name));
     }
 
     let (remote_builds, local_builds): (Vec<_>, Vec<_>) = push_data.into_iter().partition(|data| {
@@ -992,6 +1006,10 @@ async fn run_deploy(
     let mut closures: HashMap<(String, String), String> = HashMap::new();
     // Failed nodes, in the order they failed
     let mut failed_nodes: Vec<String> = Vec::new();
+    for node in unreachable {
+        error!("{}", RunDeployError::Unreachable(node.clone()));
+        failed_nodes.push(node);
+    }
     let mut record_failure = |e: RunDeployError| -> Result<(), RunDeployError> {
         match e.node_name() {
             Some(node) if keep_going => {
@@ -1232,6 +1250,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.keep_going,
         opts.no_progress,
         !opts.no_demarcate_output,
+        opts.copy_timeout,
         mp,
     )
     .await?;

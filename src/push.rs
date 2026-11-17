@@ -85,6 +85,8 @@ pub enum PushProfileError {
     PathInfo(#[from] command::CommandError<PathInfoError>),
     #[error("Copy exited with status {}", .0.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string()))]
     CopyExit(Option<i32>),
+    #[error("Copy did not finish within {} seconds", .0.as_secs())]
+    CopyTimeout(std::time::Duration),
     #[error("Build exited with status {}", .0.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string()))]
     BuildExit(Option<i32>),
     #[error(
@@ -118,6 +120,9 @@ pub struct PushProfileData {
     /// Host that builds this profile instead of the deploying machine. When it
     /// isn't the node itself, the result is copied from it to the node.
     pub build_host: Option<BuildHost>,
+    /// Stops a copy to the node that takes longer, so a host that hangs fails
+    /// instead of holding up the whole deploy.
+    pub copy_timeout: Option<std::time::Duration>,
 }
 
 /// A host reached over SSH to build profiles in its Nix store.
@@ -851,30 +856,40 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
             .env("NIX_SSHOPTS", ssh_opts_str);
 
         debug!("copy command: {:?}", copy_command);
+        // The timeout drops the future, which must also stop nix copy.
+        copy_command.kill_on_drop(true);
 
-        let copy_exit_status = if let Some(pb) = &data.deploy_data.progressbar {
-            // A progress bar is attached (concurrent deploy): pipe nix's output
-            // and route it through the spinner instead of letting it draw to the
-            // terminal (which would corrupt the bars).
-            copy_command.arg("--log-format").arg("internal-json");
-            let mut child = copy_command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("failed to spawn nix copy command");
+        let copy = async {
+            Ok::<_, PushProfileError>(if let Some(pb) = &data.deploy_data.progressbar {
+                // A progress bar is attached (concurrent deploy): pipe nix's output
+                // and route it through the spinner instead of letting it draw to the
+                // terminal (which would corrupt the bars).
+                copy_command.arg("--log-format").arg("internal-json");
+                let mut child = copy_command
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("failed to spawn nix copy command");
 
-            update_pb_with_child_output(pb, &mut child).await;
+                update_pb_with_child_output(pb, &mut child).await;
 
-            child
-                .wait()
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| PushProfileError::Copy(command::CommandError::RunError(e)))?
+            } else {
+                // No progress bar: let nix write its native output to the terminal.
+                copy_command
+                    .status()
+                    .await
+                    .map_err(|e| PushProfileError::Copy(command::CommandError::RunError(e)))?
+            })
+        };
+        let copy_exit_status = match data.copy_timeout {
+            Some(limit) => tokio::time::timeout(limit, copy)
                 .await
-                .map_err(|e| PushProfileError::Copy(command::CommandError::RunError(e)))?
-        } else {
-            // No progress bar: let nix write its native output to the terminal.
-            copy_command
-                .status()
-                .await
-                .map_err(|e| PushProfileError::Copy(command::CommandError::RunError(e)))?
+                .map_err(|_| PushProfileError::CopyTimeout(limit))??,
+            None => copy.await?,
         };
 
         match copy_exit_status.code() {

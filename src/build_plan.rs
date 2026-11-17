@@ -8,8 +8,11 @@
 //! another, so the local store shares everything they have in common. Each
 //! other system builds on one target host of that system, the least loaded
 //! one that answers. The results are then copied from there to the others.
+//!
+//! Every target host is asked first. Hosts that don't answer are left out,
+//! since copying to them would hang the deploy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -46,12 +49,27 @@ pub async fn local_system() -> Result<String, BuildPlanError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Sets where each profile builds.
-pub async fn assign_build_hosts(profiles: &mut [PushProfileData]) -> Result<(), BuildPlanError> {
+/// Sets where each profile builds. Returns the nodes that didn't answer, in
+/// the order they appear. Their profiles are left as they were.
+pub async fn assign_build_hosts(
+    profiles: &mut [PushProfileData],
+) -> Result<Vec<String>, BuildPlanError> {
     let local = local_system().await?;
-    let mut foreign: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let loads = probe_all(profiles.iter().map(BuildHost::of_node)).await;
 
+    let mut unreachable: Vec<String> = Vec::new();
+    for profile in profiles.iter() {
+        let node = &profile.deploy_data.node_name;
+        if loads[&BuildHost::of_node(profile)].is_none() && !unreachable.contains(node) {
+            unreachable.push(node.clone());
+        }
+    }
+
+    let mut foreign: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, profile) in profiles.iter_mut().enumerate() {
+        if unreachable.contains(&profile.deploy_data.node_name) {
+            continue;
+        }
         match profile.deploy_data.profile.profile_settings.system.clone() {
             Some(system) if system == local => {
                 profile.build_host = None;
@@ -72,7 +90,11 @@ pub async fn assign_build_hosts(profiles: &mut [PushProfileData]) -> Result<(), 
             }
         }
 
-        match pick_builder(candidates).await {
+        let answers = candidates.into_iter().map(|host| {
+            let load = loads[&host];
+            (host, load)
+        });
+        match least_loaded(answers) {
             Some(builder) => {
                 info!(
                     "Building {} profiles for {} on {}",
@@ -84,30 +106,31 @@ pub async fn assign_build_hosts(profiles: &mut [PushProfileData]) -> Result<(), 
                     profiles[i].build_host = Some(builder.clone());
                 }
             }
-            None => {
-                warn!("No {} host answered, so each one builds for itself", system);
-                for i in indices {
-                    profiles[i].build_host = Some(BuildHost::of_node(&profiles[i]));
-                }
-            }
+            // Every candidate answered, so this can't happen. Keep the
+            // node's own settings rather than panic.
+            None => warn!("No {} host answered", system),
         }
     }
 
-    Ok(())
+    Ok(unreachable)
 }
 
-/// The least loaded candidate that answers, or none.
-async fn pick_builder(candidates: Vec<BuildHost>) -> Option<BuildHost> {
+/// Load per core of each distinct host, asked in parallel. None means the
+/// host didn't answer.
+async fn probe_all(hosts: impl IntoIterator<Item = BuildHost>) -> HashMap<BuildHost, Option<f64>> {
     let mut probes = JoinSet::new();
-    for (order, host) in candidates.into_iter().enumerate() {
+    let mut seen = Vec::new();
+    for host in hosts {
+        if seen.contains(&host) {
+            continue;
+        }
+        seen.push(host.clone());
         probes.spawn(async move {
             let load = probe_load(&host).await;
-            (order, host, load)
+            (host, load)
         });
     }
-    let mut answers = probes.join_all().await;
-    answers.sort_by_key(|(order, _, _)| *order);
-    least_loaded(answers.into_iter().map(|(_, host, load)| (host, load)))
+    probes.join_all().await.into_iter().collect()
 }
 
 /// Load per core, or none when the host doesn't answer in time.
