@@ -235,6 +235,7 @@ pub fn init_logger(
     Ok((multi, handle))
 }
 
+pub mod build_plan;
 pub mod cli;
 pub mod command;
 pub mod data;
@@ -258,6 +259,7 @@ pub struct CmdOverrides {
     pub interactive_sudo: Option<bool>,
     pub dry_activate: bool,
     pub remote_build: bool,
+    pub build_per_system: bool,
 }
 
 #[derive(PartialEq, Debug)]

@@ -48,6 +48,7 @@ in
 # A derivation-typed path is split into outPath and drvPath.
 assert drvProfile.path == fakeProfile.outPath;
 assert drvProfile.drvPath == fakeProfile.drvPath;
+assert drvProfile.system == fakeProfile.system;
 # Sibling attrs are preserved.
 assert drvProfile.sshUser == "root";
 assert drvOut.sshUser == "deployer";
@@ -55,5 +56,6 @@ assert drvOut.nodes.demo.hostname == "demo.example";
 # A string-typed path is left untouched, and no drvPath is synthesised.
 assert strProfile.path == "/nix/store/0000000000000000000000000000000000-handwritten";
 assert !(strProfile ? drvPath);
+assert !(strProfile ? system);
 
 pkgs.runCommand "transform-deploy-test" { } "touch $out"

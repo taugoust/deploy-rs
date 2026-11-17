@@ -115,6 +115,36 @@ pub struct PushProfileData {
     pub keep_result: bool,
     pub result_path: Option<String>,
     pub extra_build_args: Vec<String>,
+    /// Host that builds this profile instead of the deploying machine. When it
+    /// isn't the node itself, the result is copied from it to the node.
+    pub build_host: Option<BuildHost>,
+}
+
+/// A host reached over SSH to build profiles in its Nix store.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BuildHost {
+    pub ssh_user: String,
+    pub hostname: String,
+    pub ssh_opts: Vec<String>,
+}
+
+impl BuildHost {
+    /// The node a profile is deployed to.
+    pub fn of_node(data: &PushProfileData) -> Self {
+        let hostname = match data.deploy_data.cmd_overrides.hostname {
+            Some(ref x) => x,
+            None => &data.deploy_data.node.node_settings.hostname,
+        };
+        BuildHost {
+            ssh_user: data.deploy_defs.ssh_user.clone(),
+            hostname: hostname.clone(),
+            ssh_opts: data.deploy_data.merged_settings.ssh_opts.clone(),
+        }
+    }
+
+    pub fn store(&self) -> String {
+        format!("ssh-ng://{}@{}", self.ssh_user, self.hostname)
+    }
 }
 
 pub async fn build_profile_locally(
@@ -474,19 +504,17 @@ pub async fn build_profile_remotely(
     data: &PushProfileData,
     derivation_name: &str,
 ) -> Result<String, PushProfileError> {
+    let build_host = data
+        .build_host
+        .clone()
+        .unwrap_or_else(|| BuildHost::of_node(data));
     info!(
-        "Building profile `{}` for node `{}` on remote host",
-        data.deploy_data.profile_name, data.deploy_data.node_name
+        "Building profile `{}` for node `{}` on `{}`",
+        data.deploy_data.profile_name, data.deploy_data.node_name, build_host.hostname
     );
+    let store_address = build_host.store();
 
-    // TODO: this should probably be handled more nicely during 'data' construction
-    let hostname = match data.deploy_data.cmd_overrides.hostname {
-        Some(ref x) => x,
-        None => &data.deploy_data.node.node_settings.hostname,
-    };
-    let store_address = format!("ssh-ng://{}@{}", data.deploy_defs.ssh_user, hostname);
-
-    let ssh_opts_str = data.deploy_data.merged_settings.ssh_opts.join(" ");
+    let ssh_opts_str = build_host.ssh_opts.join(" ");
 
     // copy the derivation to remote host so it can be built there
     let copy_command_status = {
@@ -611,12 +639,13 @@ pub async fn build_profile_remotely(
 pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfileError> {
     let profile_settings = &data.deploy_data.profile.profile_settings;
 
-    let supports_caret = data.supports_flakes
+    let builds_remotely = data.build_host.is_some()
         || data
             .deploy_data
             .merged_settings
             .remote_build
             .unwrap_or(false);
+    let supports_caret = data.supports_flakes || builds_remotely;
 
     // The eval transformation in `nix/transform-deploy.nix` attaches `drvPath`
     // to every derivation-typed profile path, so this branch is hit whenever
@@ -699,12 +728,7 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
         deriver_for_build(deriver, supports_caret).await?
     };
 
-    if data
-        .deploy_data
-        .merged_settings
-        .remote_build
-        .unwrap_or(false)
-    {
+    if builds_remotely {
         if !data.supports_flakes {
             warn!("remote builds using non-flake nix are experimental");
         }
@@ -779,13 +803,21 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
         // .collect::<Vec<String>>()
         .join(" ");
 
-    // remote building guarantees that the resulting derivation is stored on the target system
-    // no need to copy after building
-    if !data
-        .deploy_data
-        .merged_settings
-        .remote_build
-        .unwrap_or(false)
+    // Built on another host: copy from there. Built on the node itself: the
+    // result is already where it needs to be.
+    let source = match &data.build_host {
+        Some(host) if *host == BuildHost::of_node(data) => return Ok(()),
+        Some(host) => Some(host),
+        None if data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false) =>
+        {
+            return Ok(())
+        }
+        None => None,
+    };
     {
         info!(
             "Copying profile `{}` to node `{}`",
@@ -794,6 +826,10 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
 
         let mut copy_command = Command::new("nix");
         copy_command.arg("copy");
+
+        if let Some(host) = source {
+            copy_command.arg("--from").arg(host.store());
+        }
 
         if data.deploy_data.merged_settings.fast_connection != Some(true) {
             copy_command.arg("--substitute-on-destination");

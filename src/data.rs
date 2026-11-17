@@ -99,6 +99,10 @@ pub struct ProfileSettings {
     /// is wire-format plumbing, not a user setting.
     #[serde(rename(deserialize = "drvPath"))]
     pub(crate) drv_path: Option<String>,
+    /// System of that derivation, also set by the eval transformation. Used by
+    /// `--build-per-system` to build each system's profiles on one host.
+    #[serde(default)]
+    pub(crate) system: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

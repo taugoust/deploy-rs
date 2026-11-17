@@ -79,6 +79,11 @@ pub struct Opts {
     /// Build on remote host
     #[arg(long)]
     remote_build: bool,
+    /// Build each system once. Profiles for this machine's system build here,
+    /// and each other system builds on the least loaded target host of that
+    /// system that answers. The results are then copied to the other hosts.
+    #[arg(long, conflicts_with = "remote_build")]
+    build_per_system: bool,
 
     /// Override the SSH user with the given value
     #[arg(long)]
@@ -493,6 +498,8 @@ pub enum RunDeployError {
     ProfileWithoutNode,
     #[error("Error processing deployment definitions: {0}")]
     DeployDataDefs(#[from] deploy::DeployDataDefsError),
+    #[error("{0}")]
+    BuildPlan(#[from] deploy::build_plan::BuildPlanError),
     #[error("Failed to make printable TOML of deployment: {0}")]
     TomlFormat(#[from] toml::ser::Error),
     #[error("{0}")]
@@ -528,7 +535,7 @@ type ToDeploy<'a> = Vec<(
 type BuiltProfile = (String, String, String);
 // Per-host build results from the async remote-build pipeline: one Vec of
 // BuiltProfile per host (built in order), or an error if that host's build failed.
-type RemoteBuildResults = Vec<Result<Vec<BuiltProfile>, RunDeployError>>;
+type RemoteBuildResults = Vec<Vec<Result<BuiltProfile, RunDeployError>>>;
 // Per-profile build+push results from the async local-build pipeline.
 type LocalBuildResults = Vec<Result<BuiltProfile, RunDeployError>>;
 
@@ -734,8 +741,9 @@ async fn run_deploy(
         print_deployment(&parts[..])?;
     }
 
-    let data_iter = || {
-        parts.iter().map(
+    let mut push_data: Vec<deploy::push::PushProfileData> = parts
+        .iter()
+        .map(
             |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
                 supports_flakes,
                 check_sigs,
@@ -745,32 +753,37 @@ async fn run_deploy(
                 keep_result,
                 result_path: result_path.map(str::to_string),
                 extra_build_args: extra_build_args.to_vec(),
+                build_host: None,
             },
         )
-    };
+        .collect();
 
-    let (remote_builds, local_builds): (Vec<_>, Vec<_>) = data_iter().partition(|data| {
-        data.deploy_data
-            .merged_settings
-            .remote_build
-            .unwrap_or_default()
+    if cmd_overrides.build_per_system {
+        deploy::build_plan::assign_build_hosts(&mut push_data).await?;
+    }
+
+    let (remote_builds, local_builds): (Vec<_>, Vec<_>) = push_data.into_iter().partition(|data| {
+        data.build_host.is_some()
+            || data
+                .deploy_data
+                .merged_settings
+                .remote_build
+                .unwrap_or_default()
     });
 
-    // the grouping by host will retain each hosts ordering by profiles_order since the fold is synchronous
-    let remote_build_map: HashMap<_, Vec<_>> =
+    // Group by the host that builds, so one host builds its profiles one after
+    // another. This keeps each node's profiles_order since the fold is
+    // synchronous.
+    let remote_build_map: HashMap<String, Vec<_>> =
         remote_builds
             .into_iter()
             .fold(HashMap::new(), |mut accum, elem| {
-                match accum.get_mut(&elem.deploy_data.node_name) {
-                    Some(v) => {
-                        v.push(elem);
-                        accum
-                    }
-                    None => {
-                        accum.insert(elem.deploy_data.node_name.clone(), vec![elem]);
-                        accum
-                    }
-                }
+                let key = match &elem.build_host {
+                    Some(host) => host.store(),
+                    None => elem.deploy_data.node_name.clone(),
+                };
+                accum.entry(key).or_default().push(elem);
+                accum
             });
 
     // Show a progress bar only when building on more than one remote host at once
@@ -821,13 +834,18 @@ async fn run_deploy(
                 };
 
                 set.spawn(async move {
-                    let mut built = Vec::new();
-                    let mut result = Ok(());
+                    let mut results = Vec::new();
+                    let mut failed_nodes: Vec<String> = Vec::new();
+                    let mut pushes = JoinSet::new();
 
                     // build profile in order, one after the other
                     for mut profile in profiles {
                         let nodename = profile.deploy_data.node_name.clone();
                         let profilename = profile.deploy_data.profile_name.clone();
+                        // A node's later profiles depend on its earlier ones.
+                        if failed_nodes.contains(&nodename) {
+                            continue;
+                        }
                         if let Some(pb) = &pb {
                             pb.set_prefix(format!(
                                 "Building profile '{}' on host '{}'",
@@ -843,29 +861,43 @@ async fn run_deploy(
                         );
 
                         match deploy::push::build_profile(&profile).await {
-                            Ok(closure) => built.push((nodename, profilename, closure)),
+                            // Copies to other nodes run while the next profile builds.
+                            Ok(closure) => {
+                                pushes.spawn(async move {
+                                    deploy::push::push_profile(&profile, &closure)
+                                        .await
+                                        .map(|()| (nodename.clone(), profilename.clone(), closure))
+                                        .map_err(|e| {
+                                            RunDeployError::PushProfile(profilename, nodename, e)
+                                        })
+                                });
+                            }
                             Err(e) => {
-                                result =
-                                    Err(RunDeployError::BuildProfile(profilename, nodename, e));
-                                break;
+                                failed_nodes.push(nodename.clone());
+                                results.push(Err(RunDeployError::BuildProfile(
+                                    profilename,
+                                    nodename,
+                                    e,
+                                )));
                             }
                         }
                     }
+                    results.extend(pushes.join_all().await);
 
                     if let Some(pb) = &pb {
-                        match &result {
-                            Ok(()) => {
+                        match results.iter().find_map(|r| r.as_ref().err()) {
+                            None => {
                                 pb.set_style(finish_style());
                                 pb.finish_with_message("Done!");
                             }
-                            Err(e) => {
+                            Some(e) => {
                                 pb.set_style(finish_style_error());
                                 pb.finish_with_message(format!("Error: {}", e));
                             }
                         }
                     }
 
-                    result.map(|()| built)
+                    results
                 });
             }
 
@@ -972,12 +1004,10 @@ async fn run_deploy(
             _ => Err(e),
         }
     };
-    for result in remote_results {
+    for result in remote_results.into_iter().flatten() {
         match result {
-            Ok(built) => {
-                for (node_name, profile_name, closure) in built {
-                    closures.insert((node_name, profile_name), closure);
-                }
+            Ok((node_name, profile_name, closure)) => {
+                closures.insert((node_name, profile_name), closure);
             }
             Err(e) => record_failure(e)?,
         }
@@ -1145,6 +1175,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         activation_timeout: opts.activation_timeout,
         dry_activate: opts.dry_activate,
         remote_build: opts.remote_build,
+        build_per_system: opts.build_per_system,
         sudo: opts.sudo,
         interactive_sudo: opts.interactive_sudo,
     };
