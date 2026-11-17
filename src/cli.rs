@@ -125,6 +125,11 @@ pub struct Opts {
     /// Revoke all previously succeeded deploys when deploying multiple profiles
     #[arg(long)]
     rollback_succeeded: Option<bool>,
+    /// Keep deploying the other nodes when a node fails to build, push or
+    /// activate. Failed nodes are listed at the end and the exit code is
+    /// non-zero. Nothing is rolled back because another node failed.
+    #[arg(long)]
+    keep_going: bool,
     /// Which sudo command to use. Must accept at least two arguments: user name to execute commands as and the rest is the command to execute
     #[arg(long)]
     sudo: Option<String>,
@@ -464,6 +469,20 @@ pub enum RunDeployError {
     RevokeProfile(String, String, deploy::deploy::RevokeProfileError),
     #[error("Deployment to node {0} failed, rolled back to previous generation")]
     Rollback(String),
+    #[error("{} of {} nodes failed: {}", .0.len(), .1, .0.join(", "))]
+    NodesFailed(Vec<String>, usize),
+}
+
+impl RunDeployError {
+    /// The node a build, push or activation error belongs to.
+    fn node_name(&self) -> Option<&str> {
+        match self {
+            RunDeployError::DeployProfile(_, node, _)
+            | RunDeployError::BuildProfile(_, node, _)
+            | RunDeployError::PushProfile(_, node, _) => Some(node),
+            _ => None,
+        }
+    }
 }
 
 type ToDeploy<'a> = Vec<(
@@ -502,6 +521,7 @@ async fn run_deploy(
     test: bool,
     log_dir: &Option<String>,
     rollback_succeeded: bool,
+    keep_going: bool,
     no_progress: bool,
     demarcate_output: bool,
     mp: MultiProgress,
@@ -902,17 +922,41 @@ async fn run_deploy(
         }
     );
 
-    // abort here if any build + push or push + build failed, and collect the
-    // realised closure for every profile that made it through
+    // Collect the realised closure for every profile that made it through.
+    // A failed build or push aborts here, unless --keep-going is set, in which
+    // case the node is reported and left out of activation.
     let mut closures: HashMap<(String, String), String> = HashMap::new();
+    // Failed nodes, in the order they failed
+    let mut failed_nodes: Vec<String> = Vec::new();
+    let mut record_failure = |e: RunDeployError| -> Result<(), RunDeployError> {
+        match e.node_name() {
+            Some(node) if keep_going => {
+                error!("{}", e);
+                if !failed_nodes.iter().any(|n| n == node) {
+                    failed_nodes.push(node.to_string());
+                }
+                Ok(())
+            }
+            _ => Err(e),
+        }
+    };
     for result in remote_results {
-        for (node_name, profile_name, closure) in result? {
-            closures.insert((node_name, profile_name), closure);
+        match result {
+            Ok(built) => {
+                for (node_name, profile_name, closure) in built {
+                    closures.insert((node_name, profile_name), closure);
+                }
+            }
+            Err(e) => record_failure(e)?,
         }
     }
     for result in local_results {
-        let (node_name, profile_name, closure) = result?;
-        closures.insert((node_name, profile_name), closure);
+        match result {
+            Ok((node_name, profile_name, closure)) => {
+                closures.insert((node_name, profile_name), closure);
+            }
+            Err(e) => record_failure(e)?,
+        }
     }
 
     // Run all activations
@@ -921,6 +965,11 @@ async fn run_deploy(
     // the profile's configuration
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs, &str)> = vec![];
     for (_, deploy_data, deploy_defs) in &parts {
+        // A node whose build failed, or whose earlier profile failed to
+        // activate, is skipped entirely
+        if failed_nodes.contains(&deploy_data.node_name) {
+            continue;
+        }
         let closure = closures
             .get(&(
                 deploy_data.node_name.clone(),
@@ -939,6 +988,10 @@ async fn run_deploy(
         .await
         {
             error!("{}", e);
+            if keep_going {
+                failed_nodes.push(deploy_data.node_name.clone());
+                continue;
+            }
             if dry_activate {
                 info!("dry run, not rolling back");
             }
@@ -974,6 +1027,22 @@ async fn run_deploy(
             ));
         }
         succeeded.push((deploy_data, deploy_defs, closure.as_str()))
+    }
+
+    if !failed_nodes.is_empty() {
+        let mut nodes: Vec<&str> = parts
+            .iter()
+            .map(|(_, data, _)| data.node_name.as_str())
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        let deployed: Vec<&str> = nodes
+            .iter()
+            .copied()
+            .filter(|n| !failed_nodes.iter().any(|f| f == n))
+            .collect();
+        info!("Deployed {} nodes: {}", deployed.len(), deployed.join(", "));
+        return Err(RunDeployError::NodesFailed(failed_nodes, nodes.len()));
     }
 
     Ok(())
@@ -1091,6 +1160,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.test,
         &opts.log_dir,
         opts.rollback_succeeded.unwrap_or(true),
+        opts.keep_going,
         opts.no_progress,
         !opts.no_demarcate_output,
         mp,

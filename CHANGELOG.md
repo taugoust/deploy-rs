@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `deploy --keep-going` keeps deploying the other nodes when a node fails to
+  build, push or activate, and lists the failed nodes at the end. (#221)
+
 ## [1.0.0] - 2026-10-19
 
 ### Added
