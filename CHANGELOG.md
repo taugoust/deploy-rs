@@ -20,6 +20,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `deploy --groups` only evaluates nodes that can match the given groups,
   instead of evaluating every node and filtering afterwards.
 
+### Fixed
+
+- Activation creates the parent directory of a custom `profilePath`, so the
+  first deploy to a new location no longer fails in `nix-env --set`.
+
 ## [1.0.0] - 2026-10-19
 
 ### Added

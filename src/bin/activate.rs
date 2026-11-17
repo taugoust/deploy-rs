@@ -636,6 +636,9 @@ pub enum ActivateError {
     #[error("{0}")]
     SetProfile(#[from] command::CommandError<SetProfileError>),
 
+    #[error("Failed to create the profile directory {0}: {1}")]
+    CreateProfileDir(PathBuf, std::io::Error),
+
     #[error("{0}")]
     RunActivate(#[from] command::CommandError<RunActivateError>),
 
@@ -668,6 +671,15 @@ pub async fn activate(
 
     if !dry_activate {
         info!("Activating profile");
+
+        // nix-env refuses to create a profile in a directory that doesn't
+        // exist, which happens on the first deploy of a custom profilePath
+        if let Some(parent) = Path::new(&profile_path).parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ActivateError::CreateProfileDir(parent.to_path_buf(), e))?;
+        }
+
         let mut nix_env_set_command = Command::new("nix-env");
         nix_env_set_command
             .arg("-p")
