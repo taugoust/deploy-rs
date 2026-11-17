@@ -201,6 +201,8 @@ in {
   };
   # Pure-evaluation test for the drvPath auto-extraction. Runs without a VM.
   transform-deploy = import ./transform-deploy.nix { inherit pkgs; };
+  # Pure-evaluation test for filtering nodes by --groups. Runs without a VM.
+  filter-groups = import ./filter-groups.nix { inherit pkgs; };
   # e2e test for #261: lines forwarded from the server are prefixed with the
   # fax machine emoji, both on stdout and stderr, while genuinely local
   # output (deploy-rs's own log lines) is left unprefixed.

@@ -220,12 +220,45 @@ pub enum GetDeploymentDataError {
     ProfileNoNode,
 }
 
+/// Quotes `s` as a Nix string literal
+fn nix_string(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$");
+    format!("\"{}\"", escaped)
+}
+
+#[test]
+fn test_nix_string() {
+    assert_eq!(nix_string("web"), r#""web""#);
+    assert_eq!(nix_string(r#"a"b\c${d}"#), r#""a\"b\\c\${d}""#);
+}
+
 /// Evaluates the Nix in the given `repo` and return the processed Data from it
 async fn get_deployment_data(
     supports_flakes: bool,
     flakes: &[deploy::DeployFlake<'_>],
     extra_build_args: &[String],
+    groups: Option<&[String]>,
 ) -> Result<Vec<deploy::data::Data>, GetDeploymentDataError> {
+    // With --groups, nodes that can't match are dropped before evaluation;
+    // see `nix/filter-groups.nix`. The binary still filters each profile.
+    let patch_deploy = match groups {
+        Some(groups) => format!(
+            "deploy: ({}) (({}) [ {} ] deploy)",
+            include_str!("../nix/transform-deploy.nix"),
+            include_str!("../nix/filter-groups.nix"),
+            groups
+                .iter()
+                .map(|g| nix_string(g))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        None => include_str!("../nix/transform-deploy.nix").to_string(),
+    };
+    let patch_deploy = &patch_deploy;
+
     futures_util::stream::iter(flakes).then(|flake| async move {
 
     info!("Evaluating flake in {}", flake.repo);
@@ -236,12 +269,11 @@ async fn get_deployment_data(
         Command::new("nix-instantiate")
     };
 
-    // Auto-extracts `drvPath` for profiles whose `path` is a derivation, so the
-    // binary can resolve content-addressed and floating-output derivations
-    // whose eval-time `outPath` is a placeholder. The Nix file is a
-    // self-contained function from `deploy` to `deploy`; see
+    // `patch_deploy` auto-extracts `drvPath` for profiles whose `path` is a
+    // derivation, so the binary can resolve content-addressed and
+    // floating-output derivations whose eval-time `outPath` is a placeholder.
+    // The Nix file is a self-contained function from `deploy` to `deploy`; see
     // `nix/transform-deploy.nix`.
-    let patch_deploy = include_str!("../nix/transform-deploy.nix");
 
     if supports_flakes {
         eval_command
@@ -1143,7 +1175,13 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         }
     }
     let result_path = opts.result_path.as_deref();
-    let data = get_deployment_data(using_flakes, &deploy_flakes, &opts.extra_build_args).await?;
+    let data = get_deployment_data(
+        using_flakes,
+        &deploy_flakes,
+        &opts.extra_build_args,
+        cmd_overrides.groups.as_deref(),
+    )
+    .await?;
     run_deploy(
         deploy_flakes,
         data,

@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `deploy --keep-going` keeps deploying the other nodes when a node fails to
   build, push or activate, and lists the failed nodes at the end. (#221)
 
+### Changed
+
+- `deploy --groups` only evaluates nodes that can match the given groups,
+  instead of evaluating every node and filtering afterwards.
+
 ## [1.0.0] - 2026-10-19
 
 ### Added
