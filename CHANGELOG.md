@@ -23,7 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Activation creates the parent directory of a custom `profilePath`, so the
-  first deploy to a new location no longer fails in `nix-env --set`.
+  first deploy to a new location no longer fails in `nix-env --set`. The
+  deploying side creates it too, so this also works when the host's
+  `activate-rs` comes from another deploy-rs build.
 
 ## [1.0.0] - 2026-10-19
 

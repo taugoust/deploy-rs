@@ -85,9 +85,50 @@ fn build_activate_command(data: &ActivateCommandData) -> String {
 
     if let Some(sudo_cmd) = &data.sudo {
         self_activate_command = format!("{} {}", sudo_cmd, self_activate_command);
+    } else if let ProfileInfo::ProfilePath { profile_path } = data.profile_info {
+        // nix-env refuses to set a profile in a directory that doesn't exist.
+        // activate-rs on the host may come from another deploy-rs build, so
+        // create the directory here before activating.
+        if let Some(parent) = Path::new(profile_path).parent() {
+            if !data.dry_activate && parent != Path::new("/") {
+                self_activate_command = format!(
+                    "mkdir -p '{}' && {}",
+                    parent.display(),
+                    self_activate_command
+                );
+            }
+        }
     }
 
     self_activate_command
+}
+
+#[test]
+fn test_activation_command_creates_profile_directory() {
+    let profile_info = &ProfileInfo::ProfilePath {
+        profile_path: "/scratch/user/profiles/home".to_string(),
+    };
+    let no_sudo: Option<String> = None;
+    let sudo = Some("sudo -u root".to_string());
+    let build = |sudo: &Option<String>, dry_activate: bool| {
+        build_activate_command(&ActivateCommandData {
+            sudo,
+            profile_info,
+            closure: "/nix/store/blah/etc",
+            auto_rollback: true,
+            temp_path: Path::new("/tmp"),
+            confirm_timeout: 30,
+            magic_rollback: true,
+            debug_logs: false,
+            log_dir: None,
+            dry_activate,
+            boot: false,
+            test: false,
+        })
+    };
+    assert!(build(&no_sudo, false).starts_with("mkdir -p '/scratch/user/profiles' && "));
+    assert!(!build(&no_sudo, true).contains("mkdir"));
+    assert!(!build(&sudo, false).contains("mkdir"));
 }
 
 #[test]
